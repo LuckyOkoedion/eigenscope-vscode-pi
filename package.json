@@ -1,0 +1,116 @@
+{
+  "name": "eigenscope-vscode-pi",
+  "displayName": "EigenScope for VS Code & Pi",
+  "description": "Protected Pi coding agent inside VS Code with EigenScope zero-tag semantic separation, untrusted tool IPI sanitization, deterministic vault restoration, and a 3-stage protection and reasoning trace inspector.",
+  "version": "0.2.16",
+  "publisher": "guardian-ai",
+  "license": "Apache-2.0",
+  "icon": "media/icon.png",
+  "homepage": "https://eigenscope.guardianai.network/guide/coding",
+  "bugs": {
+    "url": "https://eigenscope.guardianai.network/support"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LuckyOkoedion/eigenscope-vscode-pi"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "eigenscope",
+    "pi",
+    "pi-coding-agent",
+    "privacy",
+    "prompt-injection",
+    "reasoning-trace"
+  ],
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "main": "./src/extension.cjs",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "eigenscope-pi",
+          "title": "EigenScope + Pi",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "eigenscope-pi": [
+        {
+          "type": "webview",
+          "id": "eigenscopePi.sidebar",
+          "name": "Protected Pi Agent"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "eigenscopePi.open",
+        "category": "EigenScope",
+        "title": "Open Protected Pi Workspace"
+      },
+      {
+        "command": "eigenscopePi.connectAccount",
+        "category": "EigenScope",
+        "title": "Connect EigenScope Account"
+      },
+      {
+        "command": "eigenscopePi.setupPi",
+        "category": "EigenScope",
+        "title": "Set Up Pi CLI"
+      },
+      {
+        "command": "eigenscopePi.toggleProtection",
+        "category": "EigenScope",
+        "title": "Toggle Protected / Standard Mode"
+      },
+      {
+        "command": "eigenscopePi.toggleTraceDrawer",
+        "category": "EigenScope",
+        "title": "Toggle 3-Stage Protection & Reasoning Trace"
+      },
+      {
+        "command": "eigenscopePi.openPricing",
+        "category": "EigenScope",
+        "title": "Upgrade / Add Prepaid Credit"
+      }
+    ],
+    "configuration": {
+      "title": "EigenScope for VS Code & Pi",
+      "properties": {
+        "eigenscopePi.endpointUrl": {
+          "type": "string",
+          "default": "https://eigenscope.guardianai.network",
+          "description": "EigenScope Cloud Gateway HTTPS URL or local orthocore-sidecar loopback URL."
+        },
+        "eigenscopePi.protectionMode": {
+          "type": "string",
+          "enum": [
+            "protected",
+            "audit",
+            "standard"
+          ],
+          "default": "protected",
+          "description": "Protected fails closed via EigenScope separation/rehydration; Audit observes without blocking; Standard bypasses EigenScope separation."
+        },
+        "eigenscopePi.piCommand": {
+          "type": "string",
+          "default": "pi",
+          "description": "Path or executable name for the Pi coding agent CLI."
+        },
+        "eigenscopePi.traceReceiptsEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: write mode-0600 content-free protection/trace metadata receipts (.eigenscope/trace-receipts.jsonl) with zero prompt, secret, or reasoning text."
+        }
+      }
+    }
+  }
+}
