@@ -171,12 +171,39 @@ function abortableSleep(ms, signal) {
   });
 }
 
+const VERIFICATION_LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+function validateVerificationUri(rawUri, expectedOrigin) {
+  const text = typeof rawUri === 'string' ? rawUri.trim() : '';
+  if (!text) {
+    throw new Error('Verification URI missing from onboarding response.');
+  }
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw new Error('Verification URI is not a valid URL.');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Verification URI must not include embedded credentials.');
+  }
+  const host = parsed.hostname.toLowerCase();
+  const isLoopback = VERIFICATION_LOOPBACK_HOSTS.has(host) || /^127(?:\.\d{1,3}){3}$/.test(host);
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLoopback)) {
+    throw new Error('Verification URI must use HTTPS or loopback HTTP.');
+  }
+  if (expectedOrigin && parsed.origin !== expectedOrigin) {
+    throw new Error('Untrusted cross-origin verification URI rejected.');
+  }
+  return parsed.href;
+}
+
 async function requestDeviceCode(baseUrl, fetchImpl = fetch) {
   const endpoint = normalizeEndpointUrl(baseUrl);
   const res = await fetchImpl(`${endpoint}/api/onboarding/device-code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=utf-8', Accept: 'application/json' },
-    body: JSON.stringify({ surface: 'vscode_pi', client_version: '0.2.16' }),
+    body: JSON.stringify({ surface: 'vscode_pi', client_version: '0.2.17' }),
     redirect: 'error',
     signal: AbortSignal.timeout(10000),
   });
@@ -184,7 +211,15 @@ async function requestDeviceCode(baseUrl, fetchImpl = fetch) {
   if (!res.ok || !json?.device_code || !json?.user_code || !json?.verification_uri) {
     throw new Error(`Device code request failed (${res.status})`);
   }
-  return json;
+  const verificationUri = validateVerificationUri(json.verification_uri, endpoint);
+  const verificationUriComplete = json.verification_uri_complete
+    ? validateVerificationUri(json.verification_uri_complete, endpoint)
+    : undefined;
+  return {
+    ...json,
+    verification_uri: verificationUri,
+    ...(verificationUriComplete !== undefined ? { verification_uri_complete: verificationUriComplete } : {}),
+  };
 }
 
 async function pollDeviceCode(baseUrl, deviceCode, opts = {}) {
@@ -221,6 +256,7 @@ module.exports = {
   readCredentialsFile,
   writeCredentialsFile,
   probePiCli,
+  validateVerificationUri,
   requestDeviceCode,
   pollDeviceCode,
 };

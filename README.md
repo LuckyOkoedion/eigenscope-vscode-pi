@@ -1,4 +1,4 @@
-# EigenScope for VS Code & Pi (`v0.2.16`)
+# EigenScope for VS Code & Pi (`v0.2.17`)
 
 Run the **Pi coding agent** inside VS Code with workspace file review, per-file diff & revert, and integrated **EigenScope Semantic Firewall** protection plus a live **3-Stage Protection & Reasoning Trace** inspector.
 

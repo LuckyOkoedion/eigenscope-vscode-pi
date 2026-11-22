@@ -14,7 +14,7 @@ import {
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-export const BRIDGE_VERSION = '0.2.16';
+export const BRIDGE_VERSION = '0.2.17';
 const CONTRACT_VERSION = '2026-10-18.v1';
 const MAX_DECOMPOSE_UTF8_BYTES = 131_072;
 const LOOPBACK_IPV4_RE = /^127(?:\.\d{1,3}){3}$/;

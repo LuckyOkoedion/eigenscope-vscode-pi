@@ -2,7 +2,7 @@
   "name": "eigenscope-vscode-pi",
   "displayName": "EigenScope for VS Code & Pi",
   "description": "Protected Pi coding agent inside VS Code with EigenScope zero-tag semantic separation, untrusted tool IPI sanitization, deterministic vault restoration, and a 3-stage protection and reasoning trace inspector.",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "publisher": "guardian-ai",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
