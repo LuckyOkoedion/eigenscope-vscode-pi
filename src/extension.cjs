@@ -35,12 +35,23 @@ function escapeAttr(val) {
     .replace(/>/g, '&gt;');
 }
 
-function sanitizeExternalUrl(rawUrl) {
+function sanitizeExternalUrl(rawUrl, expectedOrigin = null) {
   try {
     const parsed = new URL(String(rawUrl || ''));
-    if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && !parsed.username && !parsed.password) {
-      return parsed.href;
+    const host = parsed.hostname.toLowerCase();
+    const isLoopback =
+      host === 'localhost' || host === '::1' || host === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(host);
+    const schemeOk = parsed.protocol === 'https:' || (parsed.protocol === 'http:' && isLoopback);
+    if (!schemeOk || parsed.username || parsed.password) {
+      return null;
     }
+    if (expectedOrigin) {
+      const expected = new URL(String(expectedOrigin));
+      if (parsed.origin !== expected.origin) {
+        return null;
+      }
+    }
+    return parsed.href;
   } catch {}
   return null;
 }
@@ -166,6 +177,10 @@ function createController(context) {
   let viewRef = null;
   let rpc = null;
   let busy = false;
+  let choosingModel = false;
+  let choosingApproval = false;
+  let switchingChat = false;
+  let connectingAccount = false;
   let approvalMode = 'inherit';
   let activeModel = '';
   let canSendImages = false;
@@ -228,6 +243,11 @@ function createController(context) {
     } catch {
       // Ignore unsafe/absent credentials file until connect runs
     }
+    const envKey = String(process.env.EIGENSCOPE_API_KEY || process.env.ORTHOCORE_API_KEY || '').trim();
+    if (envKey) {
+      cachedApiKey = envKey;
+      return cachedApiKey;
+    }
     cachedApiKey = '';
     return '';
   }
@@ -250,6 +270,9 @@ function createController(context) {
       model: activeModel,
       canSendImages,
       approval: approvalMode,
+      choosingModel,
+      choosingApproval,
+      switchingChat,
       status: busy ? 'Running turn...' : piProbe.available ? 'Ready' : 'Pi CLI not detected (click Set Up Pi)',
       chatTitle: root ? path.basename(root) : 'Pi',
       activeReview: review.active,
@@ -335,7 +358,7 @@ function createController(context) {
         busy = false;
         rpc = null;
         if (code && code !== 0) {
-          messages.push({ role: 'Error', text: `Pi exited cleanly with status ${code}.` });
+          messages.push({ role: 'Error', text: `Pi exited with status ${code}.` });
         }
         postState();
       },
@@ -345,45 +368,52 @@ function createController(context) {
   }
 
   async function connectAccount() {
-    const cfg = readConfig();
-    const endpointUrl = await vscode.window.showInputBox({
-      prompt: 'EigenScope Gateway URL (HTTPS or loopback orthocore-sidecar)',
-      value: cfg.endpointUrl,
-    });
-    if (!endpointUrl) return;
-    const validEndpoint = normalizeEndpointUrl(endpointUrl);
-    await vscode.workspace.getConfiguration('eigenscopePi').update('endpointUrl', validEndpoint, vscode.ConfigurationTarget.Global);
-    const dc = await requestDeviceCode(validEndpoint);
-    const verUrl = sanitizeExternalUrl(dc.verification_uri);
-    if (verUrl) {
-      await vscode.env.openExternal(vscode.Uri.parse(verUrl));
-    }
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: `EigenScope sign-in code ${dc.user_code} — finish in browser...`,
-        cancellable: true,
-      },
-      async (_progress, token) => {
-        const ac = new AbortController();
-        token.onCancellationRequested(() => ac.abort());
-        const res = await pollDeviceCode(validEndpoint, dc.device_code, { signal: ac.signal });
-        await context.secrets.store(SECRET_API_KEY_SLOT, res.api_key);
-        writeCredentialsFile({
-          api_key: res.api_key,
-          base_url: validEndpoint,
-          tenant_id: res.tenant_id,
-          key_prefix: res.key_prefix,
-        });
-        cachedApiKey = res.api_key;
+    if (connectingAccount) return;
+    connectingAccount = true;
+    try {
+      const cfg = readConfig();
+      const endpointUrl = await vscode.window.showInputBox({
+        prompt: 'EigenScope Gateway URL (HTTPS or loopback orthocore-sidecar)',
+        value: cfg.endpointUrl,
+      });
+      if (!endpointUrl) return;
+      const validEndpoint = normalizeEndpointUrl(endpointUrl);
+      await vscode.workspace.getConfiguration('eigenscopePi').update('endpointUrl', validEndpoint, vscode.ConfigurationTarget.Global);
+      const dc = await requestDeviceCode(validEndpoint);
+      const verUrl = sanitizeExternalUrl(dc.verification_uri, validEndpoint);
+      if (!verUrl) {
+        throw new Error('Untrusted or cross-origin verification URI returned by gateway.');
       }
-    );
-    if (rpc) {
-      rpc.dispose();
-      rpc = null;
+      await vscode.env.openExternal(vscode.Uri.parse(verUrl));
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `EigenScope sign-in code ${dc.user_code} — finish in browser...`,
+          cancellable: true,
+        },
+        async (_progress, token) => {
+          const ac = new AbortController();
+          token.onCancellationRequested(() => ac.abort());
+          const res = await pollDeviceCode(validEndpoint, dc.device_code, { signal: ac.signal });
+          await context.secrets.store(SECRET_API_KEY_SLOT, res.api_key);
+          writeCredentialsFile({
+            api_key: res.api_key,
+            base_url: validEndpoint,
+            tenant_id: res.tenant_id,
+            key_prefix: res.key_prefix,
+          });
+          cachedApiKey = res.api_key;
+        }
+      );
+      if (rpc) {
+        rpc.dispose();
+        rpc = null;
+      }
+      postState();
+      vscode.window.showInformationMessage('EigenScope account connected via VS Code SecretStorage.');
+    } finally {
+      connectingAccount = false;
     }
-    postState();
-    vscode.window.showInformationMessage('EigenScope account connected via VS Code SecretStorage.');
   }
 
   async function setupPi() {
@@ -498,12 +528,113 @@ function createController(context) {
       postState();
       return;
     }
-    if (data.type === 'new-chat') {
-      messages = [];
-      traceEvents = [];
-      await rpc?.newSession().catch(() => {});
-      viewRef?.webview.postMessage({ type: 'chat-action-done' });
+    if (data.type === 'choose-model') {
+      choosingModel = true;
       postState();
+      try {
+        let picked = '';
+        if (rpc) {
+          try {
+            const available = await rpc.getAvailableModels();
+            const models = Array.isArray(available?.models) ? available.models : [];
+            if (models.length > 0) {
+              const items = models.map((m) => ({
+                label: String(m.id || m.name || m),
+                description: m.provider ? String(m.provider) : '',
+                provider: m.provider ? String(m.provider) : '',
+                id: String(m.id || m.name || m),
+              }));
+              const sel = await vscode.window.showQuickPick(items, { placeHolder: 'Select Pi model' });
+              if (sel) {
+                if (sel.provider) {
+                  await rpc.setModel(sel.provider, sel.id);
+                }
+                picked = sel.provider ? `${sel.provider}/${sel.id}` : sel.id;
+              }
+            }
+          } catch {
+            // Fall back to manual input if model listing is unavailable
+          }
+        }
+        if (!picked) {
+          const entered = await vscode.window.showInputBox({
+            prompt: 'Model identifier for Pi agent (provider/model-id or model-id)',
+            value: activeModel,
+          });
+          if (entered && entered.trim()) picked = entered.trim();
+        }
+        if (picked) activeModel = picked;
+      } finally {
+        choosingModel = false;
+        postState();
+      }
+      return;
+    }
+    if (data.type === 'choose-approval') {
+      choosingApproval = true;
+      postState();
+      try {
+        const picked = await vscode.window.showQuickPick(
+          [
+            { label: 'inherit', description: 'Use workspace/Pi default confirmation rules' },
+            { label: 'confirm-writes', description: 'Confirm file writes and commands' },
+            { label: 'read-only', description: 'Block mutating tool execution' },
+          ],
+          { placeHolder: `Tool approval mode (current: ${approvalMode})` }
+        );
+        if (picked?.label) {
+          approvalMode = picked.label;
+        }
+      } finally {
+        choosingApproval = false;
+        postState();
+      }
+      return;
+    }
+    if (data.type === 'sessions') {
+      switchingChat = true;
+      postState();
+      let changed;
+      try {
+        const items = [
+          { label: 'New Protected Session', description: 'Reset chat transcript and start fresh', action: 'new' },
+        ];
+        if (Array.isArray(data.drafts)) {
+          for (const d of data.drafts.slice(0, 20)) {
+            if (!d || typeof d.id !== 'string') continue;
+            items.push({
+              label: d.title || `Draft ${d.id}`,
+              description: 'Restore parked draft',
+              draftId: d.id,
+              action: 'switch',
+            });
+          }
+        }
+        const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Manage Protected Pi Sessions' });
+        if (picked?.action === 'new') {
+          messages = [];
+          traceEvents = [];
+          await rpc?.newSession().catch(() => {});
+          changed = { outgoing: 'session-prev', incoming: `session-${Date.now()}` };
+        } else if (picked?.action === 'switch' && picked.draftId) {
+          changed = { outgoing: 'session-prev', incoming: picked.draftId };
+        }
+      } finally {
+        switchingChat = false;
+        viewRef?.webview.postMessage({ type: 'chat-action-done', ...(changed ? { changed } : {}) });
+        postState();
+      }
+      return;
+    }
+    if (data.type === 'new-chat') {
+      try {
+        messages = [];
+        traceEvents = [];
+        await rpc?.newSession().catch(() => {});
+      } finally {
+        viewRef?.webview.postMessage({ type: 'chat-action-done' });
+        postState();
+      }
       return;
     }
     if (data.type === 'reply') {
@@ -562,6 +693,16 @@ function createController(context) {
     connectAccount,
     setupPi,
     toggleProtection,
+    handleWebviewMessage,
+    getStateSnapshot: () => ({
+      activeModel,
+      approvalMode,
+      choosingModel,
+      choosingApproval,
+      switchingChat,
+      busy,
+      cachedApiKey,
+    }),
     toggleTraceDrawer: () => viewRef?.webview.postMessage({ type: 'toggle-trace-drawer' }),
     openPricing: async () => {
       const cfg = readConfig();
@@ -592,11 +733,17 @@ function activate(context) {
 
 function deactivate() {}
 
+function _setVscodeForTest(mockVscode) {
+  vscode = mockVscode;
+}
+
 module.exports = {
   activate,
   deactivate,
+  createController,
   renderWebviewHtml,
   nextProtectionMode,
   sanitizeExternalUrl,
   classifyToolApproval,
+  _setVscodeForTest,
 };

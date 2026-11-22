@@ -1,12 +1,50 @@
 'use strict';
 
 const { spawnSync } = require('node:child_process');
+const { constants } = require('node:fs');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
 const DEFAULT_ENDPOINT = 'https://eigenscope.guardianai.network';
 const LOOPBACK_IPV4_RE = /^127(?:\.\d{1,3}){3}$/;
+
+function lstatSafe(target) {
+  try {
+    return fs.lstatSync(target);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+function isMacSystemSymlinkPrefix(cursor, resolvedTarget) {
+  if (process.platform !== 'darwin') return false;
+  if (cursor === '/tmp' && (resolvedTarget === '/tmp' || resolvedTarget.startsWith('/tmp/'))) return true;
+  if (cursor === '/var' && (resolvedTarget === '/var' || resolvedTarget.startsWith('/var/'))) return true;
+  return false;
+}
+
+function assertNoSymlinkPath(targetPath) {
+  const resolved = path.resolve(targetPath);
+  const parsed = path.parse(resolved);
+  let cursor = parsed.root;
+  for (const segment of path.relative(parsed.root, resolved).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, segment);
+    const st = lstatSafe(cursor);
+    if (!st) continue;
+    if (st.isSymbolicLink()) {
+      if (isMacSystemSymlinkPrefix(cursor, resolved)) {
+        const dest = fs.readlinkSync(cursor);
+        if (dest === 'private/tmp' || dest === '/private/tmp' || dest === 'private/var' || dest === '/private/var') {
+          continue;
+        }
+      }
+      throw new Error(`Refusing symlink path component: ${cursor}`);
+    }
+  }
+  return resolved;
+}
 
 function isLoopbackHost(hostname) {
   const host = String(hostname || '').toLowerCase();
@@ -46,21 +84,30 @@ function readCredentialsFile(credentialsPath = defaultCredentialsPath()) {
 }
 
 function writeCredentialsFile(payload, credentialsPath = defaultCredentialsPath()) {
-  const resolved = path.resolve(credentialsPath);
-  const parent = path.dirname(resolved);
+  const safePath = assertNoSymlinkPath(credentialsPath);
+  const parent = path.dirname(safePath);
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
-  if (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink()) {
-    throw new Error(`Refusing to overwrite symlink credentials file: ${resolved}`);
+  const existing = lstatSafe(safePath);
+  if (existing && (existing.isSymbolicLink() || !existing.isFile())) {
+    throw new Error(`Refusing to overwrite symlink or non-regular credentials file: ${safePath}`);
   }
-  fs.writeFileSync(
-    resolved,
-    `${JSON.stringify({ schema_version: 1, ...payload, saved_at_utc: new Date().toISOString() }, null, 2)}\n`,
-    { encoding: 'utf8', mode: 0o600 }
-  );
+  const body = `${JSON.stringify({ schema_version: 1, ...payload, saved_at_utc: new Date().toISOString() }, null, 2)}\n`;
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow;
+  const fd = fs.openSync(safePath, flags, 0o600);
+  try {
+    const fstat = fs.fstatSync(fd);
+    if (!fstat.isFile()) {
+      throw new Error(`Refusing non-regular credentials file descriptor: ${safePath}`);
+    }
+    fs.writeFileSync(fd, body, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
   if (process.platform !== 'win32') {
-    fs.chmodSync(resolved, 0o600);
+    fs.chmodSync(safePath, 0o600);
   }
-  return resolved;
+  return safePath;
 }
 
 function probePiCli(piCommand = 'pi') {
@@ -88,6 +135,42 @@ function probePiCli(piCommand = 'pi') {
   };
 }
 
+function safeJsonParse(rawText) {
+  try {
+    return rawText ? JSON.parse(rawText) : null;
+  } catch {
+    return null;
+  }
+}
+
+function combinedSignal(timeoutMs, externalSignal) {
+  const timeoutSig = AbortSignal.timeout(timeoutMs);
+  if (externalSignal && typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([timeoutSig, externalSignal]);
+  }
+  return timeoutSig;
+}
+
+function abortableSleep(ms, signal) {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(new Error('EigenScope sign-in cancelled.'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new Error('EigenScope sign-in cancelled.'));
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 async function requestDeviceCode(baseUrl, fetchImpl = fetch) {
   const endpoint = normalizeEndpointUrl(baseUrl);
   const res = await fetchImpl(`${endpoint}/api/onboarding/device-code`, {
@@ -97,7 +180,7 @@ async function requestDeviceCode(baseUrl, fetchImpl = fetch) {
     redirect: 'error',
     signal: AbortSignal.timeout(10000),
   });
-  const json = await res.json();
+  const json = safeJsonParse(await res.text());
   if (!res.ok || !json?.device_code || !json?.user_code || !json?.verification_uri) {
     throw new Error(`Device code request failed (${res.status})`);
   }
@@ -114,16 +197,19 @@ async function pollDeviceCode(baseUrl, deviceCode, opts = {}) {
     if (opts.signal?.aborted) throw new Error('EigenScope sign-in cancelled.');
     const res = await fetchImpl(
       `${endpoint}/api/onboarding/device-poll?device_code=${encodeURIComponent(deviceCode)}`,
-      { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(10000) }
+      { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', signal: combinedSignal(10000, opts.signal) }
     );
-    const json = await res.json();
-    if (res.ok && json?.status === 'authorized' && typeof json.api_key === 'string') {
-      return json;
+    const json = safeJsonParse(await res.text());
+    const apiKey = typeof json?.api_key === 'string' && json.api_key.trim()
+      ? json.api_key.trim()
+      : (typeof json?.access_token === 'string' && json.access_token.trim() ? json.access_token.trim() : '');
+    if (res.ok && (json?.status === 'approved' || json?.status === 'authorized') && apiKey) {
+      return { ...json, api_key: apiKey };
     }
     if (res.status === 404 || res.status === 410 || json?.status === 'expired' || json?.status === 'denied') {
       throw new Error(`EigenScope device login ${json?.status || 'expired'}.`);
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await abortableSleep(intervalMs, opts.signal);
   }
   throw new Error('Timed out waiting for browser authorization.');
 }

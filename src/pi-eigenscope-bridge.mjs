@@ -2,11 +2,13 @@ import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
-  existsSync,
+  constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -14,6 +16,7 @@ import path from 'node:path';
 
 export const BRIDGE_VERSION = '0.2.16';
 const CONTRACT_VERSION = '2026-10-18.v1';
+const MAX_DECOMPOSE_UTF8_BYTES = 131_072;
 const LOOPBACK_IPV4_RE = /^127(?:\.\d{1,3}){3}$/;
 
 const CODING_AGENT_FIREWALL_POLICY = {
@@ -104,10 +107,19 @@ function normalizeEndpoint(rawUrl) {
   return candidate.replace(/\/+$/, '');
 }
 
+function lstatSafe(target) {
+  try {
+    return lstatSync(target);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
 function readCredentialsFileSafe() {
   const credPath = path.join(homedir(), '.config', 'eigenscope', 'credentials.json');
-  if (!existsSync(credPath)) return null;
-  const st = lstatSync(credPath);
+  const st = lstatSafe(credPath);
+  if (!st) return null;
   if (st.isSymbolicLink() || !st.isFile()) {
     throw new Error(`Refusing symlink or non-regular credentials file: ${credPath}`);
   }
@@ -130,13 +142,28 @@ function newUuidV7() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+function isMacSystemSymlinkPrefix(cursor, resolvedTarget) {
+  if (process.platform !== 'darwin') return false;
+  if (cursor === '/tmp' && (resolvedTarget === '/tmp' || resolvedTarget.startsWith('/tmp/'))) return true;
+  if (cursor === '/var' && (resolvedTarget === '/var' || resolvedTarget.startsWith('/var/'))) return true;
+  return false;
+}
+
 function assertNoSymlinkPath(targetPath) {
   const resolved = path.resolve(targetPath);
   const root = path.parse(resolved).root;
   let cursor = root;
   for (const segment of path.relative(root, resolved).split(path.sep).filter(Boolean)) {
     cursor = path.join(cursor, segment);
-    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+    const st = lstatSafe(cursor);
+    if (!st) continue;
+    if (st.isSymbolicLink()) {
+      if (isMacSystemSymlinkPrefix(cursor, resolved)) {
+        const dest = readlinkSync(cursor);
+        if (dest === 'private/tmp' || dest === '/private/tmp' || dest === 'private/var' || dest === '/private/var') {
+          continue;
+        }
+      }
       throw new Error(`Refusing symlink trace receipt path: ${cursor}`);
     }
   }
@@ -146,7 +173,11 @@ function assertNoSymlinkPath(targetPath) {
 function writeContentFreeReceipt(receiptPath, event) {
   const safePath = assertNoSymlinkPath(receiptPath);
   const parent = path.dirname(safePath);
-  if (!existsSync(parent)) mkdirSync(parent, { recursive: true, mode: 0o700 });
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const existing = lstatSafe(safePath);
+  if (existing && (existing.isSymbolicLink() || !existing.isFile())) {
+    throw new Error(`Refusing symlink or non-regular trace receipt file: ${safePath}`);
+  }
   const contentFree = {
     schema_version: 1,
     surface: 'vscode_pi',
@@ -172,8 +203,13 @@ function writeContentFreeReceipt(receiptPath, event) {
     vault_ticket_scrubbed: Boolean(event.vault_ticket_scrubbed),
     ...(event.blocked_reason ? { blocked_reason: String(event.blocked_reason).slice(0, 160) } : {}),
   };
-  const fd = openSync(safePath, 'a', 0o600);
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(safePath, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | noFollow, 0o600);
   try {
+    const fstat = fstatSync(fd);
+    if (!fstat.isFile()) {
+      throw new Error(`Refusing non-regular trace receipt file descriptor: ${safePath}`);
+    }
     writeSync(fd, `${JSON.stringify(contentFree)}\n`, undefined, 'utf8');
   } finally {
     closeSync(fd);
@@ -257,6 +293,7 @@ export function createBridgeFirewall(options = {}) {
   let thinkingObserved = false;
   let thinkingBuffer = '';
   let assistantBuffer = '';
+  let lastThinkingSig = '';
   let latestSymbols = [];
   const activeTickets = [];
   const history = [];
@@ -277,21 +314,39 @@ export function createBridgeFirewall(options = {}) {
       signal: AbortSignal.timeout(10_000),
     });
     const text = await res.text();
-    const json = text ? JSON.parse(text) : null;
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
     return { ok: res.ok, status: res.status, json };
   }
 
   async function decompose(text, policy) {
+    if (typeof text !== 'string' || text.includes('\u0000')) {
+      throw new Error('Input contains NUL bytes and cannot be sent to EigenScope.');
+    }
+    const normalized = text.normalize('NFC');
+    if (Buffer.byteLength(normalized, 'utf8') > MAX_DECOMPOSE_UTF8_BYTES) {
+      throw new Error(`Input exceeds EigenScope max UTF-8 payload (${MAX_DECOMPOSE_UTF8_BYTES} bytes).`);
+    }
     const request_id = newUuidV7();
     const res = await postJson('/v1/decompose', {
       schema_version: 1,
       request_id,
       execution_mode: 'vpc_sidecar',
-      input_payload: { kind: 'raw_text', text: text.normalize('NFC'), token_limit: 4096 },
+      input_payload: { kind: 'raw_text', text: normalized, token_limit: 4096 },
       separation_policy: policy,
       return_token_saliency: false,
     });
-    if (!res.ok || res.json?.status !== 'DECOMPOSED_OK' || typeof res.json.task_core !== 'string' || typeof res.json.vault_ticket !== 'string') {
+    if (
+      !res.ok ||
+      res.json?.status !== 'DECOMPOSED_OK' ||
+      res.json?.request_id !== request_id ||
+      typeof res.json.task_core !== 'string' ||
+      typeof res.json.vault_ticket !== 'string'
+    ) {
       throw new Error(`EigenScope /v1/decompose failed closed (${res.status} ${res.json?.error_code || 'ERROR'}).`);
     }
     return res.json;
@@ -299,15 +354,16 @@ export function createBridgeFirewall(options = {}) {
 
   async function rehydrate(vaultTicket, output) {
     const request_id = newUuidV7();
+    const normalized = String(output || '').normalize('NFC');
     const res = await postJson('/v1/rehydrate', {
       schema_version: 1,
       request_id,
       vault_ticket: vaultTicket,
-      llm_task_output: output.normalize('NFC'),
+      llm_task_output: normalized,
       target_style_register: 'preserve_llm_default',
       consume_and_scrub_vault_ticket: true,
     });
-    if (!res.ok || res.json?.status !== 'REHYDRATED_OK') {
+    if (!res.ok || res.json?.status !== 'REHYDRATED_OK' || res.json?.request_id !== request_id) {
       throw new Error(`EigenScope /v1/rehydrate failed (${res.status} ${res.json?.error_code || 'ERROR'}).`);
     }
     return res.json;
@@ -342,12 +398,14 @@ export function createBridgeFirewall(options = {}) {
     if (originError) return originError;
     if (credError) return credError;
     if (!apiKey) return 'EigenScope API key not configured. Click Connect EigenScope.';
+    if (/[\r\n\u0000]/.test(apiKey)) return 'EigenScope API key contains invalid control characters.';
     return undefined;
   }
 
   function attach(pi) {
     pi.on('context', async (event, ctx) => {
       if (mode === 'off' || !Array.isArray(event?.messages)) return event;
+      lastThinkingSig = '';
       const err = configErr();
       if (err) {
         emit({
@@ -370,46 +428,96 @@ export function createBridgeFirewall(options = {}) {
       }
 
       const cloned = [];
-      for (const msg of event.messages) {
-        if (!msg || typeof msg !== 'object') continue;
-        if (msg.role !== 'user') {
-          cloned.push({ ...msg, content: Array.isArray(msg.content) ? msg.content.map((b) => ({ ...b })) : msg.content });
-          continue;
+      const newlyCreatedTickets = [];
+      try {
+        for (const msg of event.messages) {
+          if (!msg || typeof msg !== 'object') continue;
+          if (msg.role !== 'user') {
+            cloned.push({ ...msg, content: Array.isArray(msg.content) ? msg.content.map((b) => ({ ...b })) : msg.content });
+            continue;
+          }
+          const rawText = extractText(msg.content);
+          if (!rawText.trim()) {
+            cloned.push({ ...msg });
+            continue;
+          }
+          const dec = await decompose(rawText, CODING_AGENT_FIREWALL_POLICY);
+          const symbolKeys = Array.isArray(dec.private_symbol_summary?.symbol_keys)
+            ? dec.private_symbol_summary.symbol_keys
+            : [];
+          for (const k of symbolKeys) if (!latestSymbols.includes(k)) latestSymbols.push(k);
+          const rec = { vaultTicket: dec.vault_ticket, stage: 'context' };
+          activeTickets.push(rec);
+          newlyCreatedTickets.push(rec);
+          cloned.push(cloneWithText(msg, dec.task_core));
+          emit({
+            turn_index: turnIndex,
+            stage: 'decompose',
+            timestamp_utc: new Date().toISOString(),
+            protection_mode: mode,
+            request_id: dec.request_id,
+            status: dec.status,
+            symbol_count: dec.private_symbol_summary?.symbol_count ?? symbolKeys.length,
+            symbol_keys: symbolKeys,
+            task_sufficiency_eta: dec.telemetry?.task_sufficiency_eta,
+            mi_leakage_bound_bits: dec.telemetry?.mi_leakage_bound_bits,
+            token_compression_ratio_rho: dec.telemetry?.token_compression_ratio_rho,
+            latency_ms: dec.telemetry?.latency_ms,
+            thinking_capability: 'not_requested',
+            thinking_present: false,
+            thinking_chars: 0,
+            confusion_flags: [],
+            vault_ticket_scrubbed: false,
+            task_core_preview: dec.task_core.slice(0, 600),
+          }, ctx, true);
         }
-        const rawText = extractText(msg.content);
-        if (!rawText.trim()) {
-          cloned.push({ ...msg });
-          continue;
+        return { messages: cloned };
+      } catch (errCause) {
+        for (const rec of newlyCreatedTickets) {
+          const idx = activeTickets.indexOf(rec);
+          if (idx >= 0) activeTickets.splice(idx, 1);
+          await scrub(rec.vaultTicket);
         }
-        const dec = await decompose(rawText, CODING_AGENT_FIREWALL_POLICY);
-        const symbolKeys = Array.isArray(dec.private_symbol_summary?.symbol_keys)
-          ? dec.private_symbol_summary.symbol_keys
-          : [];
-        for (const k of symbolKeys) if (!latestSymbols.includes(k)) latestSymbols.push(k);
-        activeTickets.push({ vaultTicket: dec.vault_ticket, stage: 'context' });
-        cloned.push(cloneWithText(msg, dec.task_core));
         emit({
           turn_index: turnIndex,
-          stage: 'decompose',
+          stage: 'blocked',
           timestamp_utc: new Date().toISOString(),
           protection_mode: mode,
-          request_id: dec.request_id,
-          status: dec.status,
-          symbol_count: dec.private_symbol_summary?.symbol_count ?? symbolKeys.length,
-          symbol_keys: symbolKeys,
-          task_sufficiency_eta: dec.telemetry?.task_sufficiency_eta,
-          mi_leakage_bound_bits: dec.telemetry?.mi_leakage_bound_bits,
-          token_compression_ratio_rho: dec.telemetry?.token_compression_ratio_rho,
-          latency_ms: dec.telemetry?.latency_ms,
+          status: mode === 'protected' ? 'BLOCKED_FAIL_CLOSED' : 'AUDIT_DECOMPOSE_ERROR',
+          symbol_count: latestSymbols.length,
+          symbol_keys: [...latestSymbols],
           thinking_capability: 'not_requested',
           thinking_present: false,
           thinking_chars: 0,
           confusion_flags: [],
-          vault_ticket_scrubbed: false,
-          task_core_preview: dec.task_core.slice(0, 600),
+          vault_ticket_scrubbed: true,
+          blocked_reason: errCause instanceof Error ? errCause.message : String(errCause),
         }, ctx, true);
+        if (mode === 'protected') throw errCause;
+        return { messages: event.messages.map((m) => ({ ...m })) };
       }
-      return { messages: cloned };
+    });
+
+    pi.on('tool_call', async (event, ctx) => {
+      if (mode !== 'protected') return undefined;
+      const err = configErr();
+      if (!err) return undefined;
+      emit({
+        turn_index: turnIndex,
+        stage: 'blocked',
+        timestamp_utc: new Date().toISOString(),
+        protection_mode: mode,
+        status: 'BLOCKED_FAIL_CLOSED',
+        symbol_count: latestSymbols.length,
+        symbol_keys: [...latestSymbols],
+        thinking_capability: 'not_requested',
+        thinking_present: false,
+        thinking_chars: 0,
+        confusion_flags: [],
+        vault_ticket_scrubbed: true,
+        blocked_reason: `Tool call '${event?.toolName || 'tool'}' blocked: ${err}`,
+      }, ctx, true);
+      return { block: true, reason: err };
     });
 
     pi.on('tool_result', async (event, ctx) => {
@@ -474,21 +582,25 @@ export function createBridgeFirewall(options = {}) {
         thinkingBuffer += delta;
         const analysis = analyzeReasoningForConfusion(thinkingBuffer, latestSymbols);
         if (analysis.flagged) {
-          emit({
-            turn_index: turnIndex,
-            stage: 'thinking_observation',
-            timestamp_utc: new Date().toISOString(),
-            protection_mode: mode,
-            status: 'COT_CONFUSION_FLAGGED',
-            symbol_count: latestSymbols.length,
-            symbol_keys: [...latestSymbols],
-            thinking_capability: 'observed',
-            thinking_present: true,
-            thinking_chars: thinkingBuffer.length,
-            confusion_flags: analysis.flags,
-            vault_ticket_scrubbed: false,
-            thinking_preview: thinkingBuffer.slice(-600),
-          }, ctx, false);
+          const sig = [...new Set(analysis.flags.map((f) => f.kind))].sort().join(',');
+          if (sig !== lastThinkingSig) {
+            lastThinkingSig = sig;
+            emit({
+              turn_index: turnIndex,
+              stage: 'thinking_observation',
+              timestamp_utc: new Date().toISOString(),
+              protection_mode: mode,
+              status: 'COT_CONFUSION_FLAGGED',
+              symbol_count: latestSymbols.length,
+              symbol_keys: [...latestSymbols],
+              thinking_capability: 'observed',
+              thinking_present: true,
+              thinking_chars: thinkingBuffer.length,
+              confusion_flags: analysis.flags,
+              vault_ticket_scrubbed: false,
+              thinking_preview: thinkingBuffer.slice(-600),
+            }, ctx, false);
+          }
         }
       } else if (type === 'text_delta') {
         assistantBuffer += delta;
@@ -525,28 +637,37 @@ export function createBridgeFirewall(options = {}) {
       let scrubbed = batch.length === 0;
       let requestId;
       let latencyMs;
+      let rehydrateError = null;
 
-      if (primary && rawAssistantText && !configErr() && mode !== 'off') {
-        const reh = await rehydrate(primary.vaultTicket, rawAssistantText);
-        rehydratedText = reh.rehydrated_text;
-        status = reh.status;
-        requestId = reh.request_id;
-        symbolsResolved = reh.round_trip_verification?.symbols_resolved ?? 0;
-        unresolvedPlaceholders = reh.round_trip_verification?.unresolved_placeholders ?? 0;
-        exactMatch = reh.round_trip_verification?.exact_identifier_match ?? true;
-        scrubbed = Boolean(reh.round_trip_verification?.vault_ticket_scrubbed ?? true);
-        latencyMs = reh.round_trip_verification?.latency_ms;
-      } else if (primary) {
-        await scrub(primary.vaultTicket);
+      try {
+        if (primary && rawAssistantText && !configErr() && mode !== 'off') {
+          const reh = await rehydrate(primary.vaultTicket, rawAssistantText);
+          rehydratedText = reh.rehydrated_text;
+          status = reh.status;
+          requestId = reh.request_id;
+          symbolsResolved = reh.round_trip_verification?.symbols_resolved ?? 0;
+          unresolvedPlaceholders = reh.round_trip_verification?.unresolved_placeholders ?? 0;
+          exactMatch = reh.round_trip_verification?.exact_identifier_match ?? true;
+          scrubbed = Boolean(reh.round_trip_verification?.vault_ticket_scrubbed ?? true);
+          latencyMs = reh.round_trip_verification?.latency_ms;
+        } else if (primary) {
+          await scrub(primary.vaultTicket);
+          scrubbed = true;
+        }
+      } catch (errCause) {
+        rehydrateError = errCause;
+        status = 'REHYDRATE_ERROR_SCRUBBED';
+        if (primary) await scrub(primary.vaultTicket);
         scrubbed = true;
-      }
-      for (const extra of batch) {
-        if (extra !== primary) await scrub(extra.vaultTicket);
+      } finally {
+        for (const extra of batch) {
+          if (extra !== primary) await scrub(extra.vaultTicket);
+        }
       }
 
       emit({
         turn_index: turnIndex,
-        stage: 'rehydrate',
+        stage: rehydrateError ? 'blocked' : 'rehydrate',
         timestamp_utc: new Date().toISOString(),
         protection_mode: mode,
         request_id: requestId,
@@ -562,18 +683,23 @@ export function createBridgeFirewall(options = {}) {
         unresolved_placeholders: unresolvedPlaceholders,
         exact_identifier_match: exactMatch,
         vault_ticket_scrubbed: scrubbed,
+        ...(rehydrateError ? { blocked_reason: rehydrateError instanceof Error ? rehydrateError.message : String(rehydrateError) } : {}),
         thinking_preview: thinkingObserved ? thinkingBuffer.slice(0, 600) : undefined,
       }, ctx, true);
 
-      if (rehydratedText && rehydratedText !== rawAssistantText) {
+      if (!rehydrateError && rehydratedText && rehydratedText !== rawAssistantText) {
         ctx?.ui?.setStatus?.('eigenscope_rehydrated', JSON.stringify({ turnIndex, rehydratedText }));
       }
 
       thinkingBuffer = '';
       assistantBuffer = '';
+      lastThinkingSig = '';
       latestSymbols = [];
       thinkingObserved = false;
       turnIndex += 1;
+      if (rehydrateError && mode === 'protected') {
+        throw rehydrateError;
+      }
       return { rehydratedText, vaultTicketScrubbed: scrubbed };
     });
 
