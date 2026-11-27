@@ -5,6 +5,8 @@ const prompt = byId('prompt');
 const transcript = byId('transcript');
 const traceDrawer = byId('trace-drawer');
 const traceToggle = byId('trace-toggle');
+const agentsDrawer = byId('agents-drawer');
+const agentsToggle = byId('agents-toggle');
 const protectionToggle = byId('protection-toggle');
 const eigenscopeStatusEl = byId('eigenscope-status');
 const liveDialogs = new Map();
@@ -13,6 +15,26 @@ let fileState = '';
 let copyId = 0;
 const copyRequests = new Map();
 let latestTraceEvents = [];
+let latestCotSteps = [];
+let cotActiveFilter = 'all';
+let cotCollapsedIds = new Set();
+let cotRefreshTimer = null;
+let latestIdeAgents = null;
+let agentsAutoOpened = false;
+
+function syncCotRefreshTimer() {
+  const shouldPoll = Boolean(traceDrawer && !traceDrawer.hidden && !document.hidden);
+  if (shouldPoll && !cotRefreshTimer) {
+    cotRefreshTimer = setInterval(() => {
+      if (traceDrawer && !traceDrawer.hidden && !document.hidden) {
+        host.postMessage({ type: 'refresh-cot-stream' });
+      }
+    }, 2500);
+  } else if (!shouldPoll && cotRefreshTimer) {
+    clearInterval(cotRefreshTimer);
+    cotRefreshTimer = null;
+  }
+}
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -48,94 +70,217 @@ function renderTraceDrawer() {
   if (!body || !capBadge) return;
   body.replaceChildren();
 
-  if (!latestTraceEvents.length) {
-    capBadge.textContent = 'No turns traced yet';
-    body.append(element('p', 'Send a message in Protected or Audit mode to inspect Decompose, Model CoT Reception, and Rehydrate stages.', 'trace-kv'));
+  const fmtNum = (val, digits = 4) => (typeof val === 'number' && Number.isFinite(val) ? val.toFixed(digits) : 'n/a');
+  const fmtTime = (ts) => {
+    if (!ts) return '';
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return String(ts).slice(0, 19);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  const steps = Array.isArray(latestCotSteps) ? latestCotSteps : [];
+  const pipelineEvents = latestTraceEvents.filter(
+    (ev) => ev && ev.protection_mode !== 'observed_external' && ev.protection_mode !== 'external_store'
+  );
+  const numericTurns = latestTraceEvents.filter((ev) => ev && Number.isFinite(ev.turn_index));
+  const latestTurn = numericTurns.length ? numericTurns[numericTurns.length - 1].turn_index : null;
+  const turnEvents =
+    latestTurn !== null
+      ? latestTraceEvents.filter((ev) => ev && ev.turn_index === latestTurn)
+      : pipelineEvents.length
+        ? pipelineEvents
+        : latestTraceEvents;
+  const decomposeEv = [...turnEvents].reverse().find((ev) => ev.stage === 'decompose' || ev.stage === 'tool_result');
+  const rehydrateEv = [...turnEvents].reverse().find((ev) => ev.stage === 'rehydrate' || ev.stage === 'blocked' || ev.stage === 'scrub');
+
+  const cotStepCount = steps.filter((s) => Boolean(s.cotText)).length;
+  const toolTotalCount = steps.reduce((acc, s) => acc + (Array.isArray(s.toolCalls) ? s.toolCalls.length : 0), 0);
+  const flagTotalCount = steps.reduce((acc, s) => acc + (Array.isArray(s.flags) ? s.flags.length : 0), 0);
+
+  capBadge.textContent = `${steps.length} steps / ${cotStepCount} cot / ${toolTotalCount} tools / ${flagTotalCount} flags`;
+
+  const filterBar = element('div', undefined, 'cot-filter-bar');
+  const filterDefs = [
+    ['all', 'All Steps'],
+    ['cot', 'CoT Only'],
+    ['tools', 'Tool Calls'],
+    ['flags', 'Flags'],
+  ];
+  for (const [id, label] of filterDefs) {
+    const btn = element('button', label, cotActiveFilter === id ? 'cot-filter-pill active' : 'cot-filter-pill');
+    btn.type = 'button';
+    btn.addEventListener('click', () => {
+      cotActiveFilter = id;
+      renderTraceDrawer();
+    });
+    filterBar.append(btn);
+  }
+  const spacer = element('div', undefined, 'cot-filter-spacer');
+  const refreshBtn = element('button', 'Refresh', 'cot-filter-pill');
+  refreshBtn.type = 'button';
+  refreshBtn.addEventListener('click', () => host.postMessage({ type: 'refresh-cot-stream' }));
+  const jumpBtn = element('button', '↓ Jump to latest', 'cot-filter-pill');
+  jumpBtn.type = 'button';
+  jumpBtn.addEventListener('click', () => {
+    traceDrawer.scrollTop = traceDrawer.scrollHeight;
+  });
+  spacer.append(refreshBtn, jumpBtn);
+  filterBar.append(spacer);
+  body.append(filterBar);
+
+  if (decomposeEv || rehydrateEv) {
+    const stripParts = [];
+    if (decomposeEv) {
+      stripParts.push(
+        `Stage 1 Guard: ${decomposeEv.status} (${decomposeEv.symbol_count ?? 0} sym · eta=${fmtNum(decomposeEv.task_sufficiency_eta, 4)} · MI=${fmtNum(decomposeEv.mi_leakage_bound_bits, 4)} bits)`
+      );
+    }
+    if (rehydrateEv) {
+      stripParts.push(
+        `Stage 3 Rehydrate: ${rehydrateEv.status} (resolved=${rehydrateEv.symbols_resolved ?? 0} · scrubbed=${rehydrateEv.vault_ticket_scrubbed ? 'YES' : 'pending'})`
+      );
+    }
+    body.append(element('div', stripParts.join('  |  '), 'cot-summary-strip'));
+  }
+
+  const filteredSteps = steps.filter((step) => {
+    if (cotActiveFilter === 'cot') return Boolean(step.cotText || step.encryptedOnly);
+    if (cotActiveFilter === 'tools') return Array.isArray(step.toolCalls) && step.toolCalls.length > 0;
+    if (cotActiveFilter === 'flags') return Array.isArray(step.flags) && step.flags.length > 0;
+    return true;
+  });
+
+  if (!filteredSteps.length) {
+    body.append(
+      element(
+        'p',
+        steps.length
+          ? `No steps match the '${cotActiveFilter}' filter. Click 'All Steps' or 'Refresh'.`
+          : 'No agent CoT steps discovered yet. Start a Pi, Claude Code, Codex, Gemini CLI, Cursor, or Antigravity session in this workspace and CoT Explorer streams reasoning in RAM without saving content to disk.',
+        'trace-kv'
+      )
+    );
     return;
   }
 
-  const latestTurn = latestTraceEvents[latestTraceEvents.length - 1].turn_index;
-  const turnEvents = latestTraceEvents.filter((ev) => ev.turn_index === latestTurn);
-  const decomposeEv = [...turnEvents].reverse().find((ev) => ev.stage === 'decompose' || ev.stage === 'tool_result');
-  const thinkingEv = [...turnEvents].reverse().find((ev) => ev.stage === 'thinking_observation' || ev.thinking_present) ?? turnEvents[turnEvents.length - 1];
-  const rehydrateEv = [...turnEvents].reverse().find((ev) => ev.stage === 'rehydrate' || ev.stage === 'blocked' || ev.stage === 'scrub');
-
-  const cap = rehydrateEv?.thinking_capability ?? thinkingEv?.thinking_capability ?? 'not_requested';
-  capBadge.textContent =
-    cap === 'observed'
-      ? `Turn ${latestTurn + 1} · CoT Observed (${thinkingEv?.thinking_chars ?? 0} chars)`
-      : cap === 'not_emitted_by_provider'
-        ? `Turn ${latestTurn + 1} · Provider did not emit reasoning tokens`
-        : `Turn ${latestTurn + 1} · Pending`;
-
-  const s1 = element('section', undefined, 'trace-stage-card');
-  s1.append(element('h4', 'Stage 1 · Decompose & Quarantine'));
-  if (decomposeEv) {
-    const keysText = decomposeEv.symbol_keys?.length ? decomposeEv.symbol_keys.join(', ') : 'none';
-    s1.append(
-      element('div', `Status: ${decomposeEv.status} (${decomposeEv.symbol_count} protected)`, 'trace-kv'),
-      element('div', `Vault keys: ${keysText}`, 'trace-kv'),
-      element(
-        'div',
-        `eta=${decomposeEv.task_sufficiency_eta ?? 'n/a'} · mi=${decomposeEv.mi_leakage_bound_bits ?? 'n/a'} bits · rho=${decomposeEv.token_compression_ratio_rho ?? 'n/a'} · ${decomposeEv.latency_ms ?? 'n/a'} ms`,
-        'trace-kv'
-      )
+  for (const step of filteredSteps) {
+    const hasFlags = Array.isArray(step.flags) && step.flags.length > 0;
+    const card = element('article', undefined, hasFlags ? 'cot-stream-card' : 'cot-stream-card clear');
+    const head = element('div', undefined, 'cot-stream-head');
+    head.append(
+      element('span', `#${step.stepNumber}`, 'cot-step-num'),
+      element('span', step.surface || 'agent', 'cot-kind-badge'),
+      element('span', step.kind || 'CHAIN OF THOUGHT', 'cot-kind-badge')
     );
-    if (decomposeEv.task_core_preview) {
-      const pre = element('pre', decomposeEv.task_core_preview, 'trace-pre');
-      s1.append(pre);
+    const tcCount = Array.isArray(step.toolCalls) ? step.toolCalls.length : 0;
+    if (tcCount > 0) {
+      head.append(element('span', `${tcCount} ${tcCount === 1 ? 'tool' : 'tools'}`, 'cot-tool-badge'));
     }
-  } else {
-    s1.append(element('div', 'No pre-inference separation step recorded on this turn.', 'trace-kv'));
-  }
+    const metaRight = [];
+    if (step.timestamp) metaRight.push(fmtTime(step.timestamp));
+    if (step.tokensIn !== null || step.tokensOut !== null) {
+      metaRight.push(`${step.tokensIn ?? 0} in / ${step.tokensOut ?? 0} out`);
+    }
+    if (metaRight.length) {
+      head.append(element('span', metaRight.join(' · '), 'cot-meta-right'));
+    }
+    card.append(head);
 
-  const s2 = element('section', undefined, 'trace-stage-card');
-  s2.append(element('h4', 'Stage 2 · Model Reception & CoT'));
-  if (thinkingEv) {
-    s2.append(
-      element('div', `Capability: ${thinkingEv.thinking_capability}`, 'trace-kv'),
-      element('div', `Reasoning chars: ${thinkingEv.thinking_chars ?? 0}`, 'trace-kv')
-    );
-    const flags = thinkingEv.confusion_flags ?? rehydrateEv?.confusion_flags ?? [];
-    if (flags.length) {
-      for (const flag of flags) {
-        s2.append(element('div', `${flag.kind}: ${flag.label}${flag.excerpt ? ` — "${flag.excerpt}"` : ''}`, 'trace-flag'));
+    if (hasFlags) {
+      const warn = element('div', undefined, 'cot-warning-banner');
+      warn.append(element('span', `${step.flags[0].label}:`));
+      for (const flag of step.flags) {
+        if (flag.keyword) {
+          warn.append(element('span', flag.keyword, 'cot-keyword-chip'));
+        }
       }
-    } else {
-      s2.append(element('div', 'Diagnostic flags: none detected.', 'trace-kv'));
+      card.append(warn);
     }
-    const preview = thinkingEv.thinking_preview || rehydrateEv?.thinking_preview;
-    if (preview) {
-      s2.append(element('pre', preview, 'trace-pre'));
-    }
-  } else {
-    s2.append(element('div', 'Waiting for model response.', 'trace-kv'));
-  }
 
-  const s3 = element('section', undefined, 'trace-stage-card');
-  s3.append(element('h4', 'Stage 3 · Rehydrate & Vault Scrub'));
-  if (rehydrateEv) {
-    s3.append(
-      element('div', `Status: ${rehydrateEv.status}`, 'trace-kv'),
-      element(
-        'div',
-        `Resolved: ${rehydrateEv.symbols_resolved ?? 0} · Unresolved: ${rehydrateEv.unresolved_placeholders ?? 0} · Exact match: ${String(rehydrateEv.exact_identifier_match ?? 'n/a')}`,
-        'trace-kv'
-      ),
-      element(
-        'div',
-        `Vault ticket scrubbed: ${rehydrateEv.vault_ticket_scrubbed ? 'YES' : 'pending'} · ${rehydrateEv.latency_ms ?? 'n/a'} ms`,
-        'trace-kv'
-      )
+    if (step.cotText || step.encryptedOnly) {
+      const box = element('div', undefined, 'cot-thought-box');
+      const thHead = element('div', undefined, 'cot-thought-head');
+      thHead.append(element('span', 'CHAIN OF THOUGHT'));
+      if (hasFlags) {
+        thHead.append(element('span', 'HEDGING', 'cot-hedging-pill'));
+      }
+      const isCollapsed = cotCollapsedIds.has(step.id);
+      const colBtn = element('button', isCollapsed ? 'expand' : 'collapse', 'cot-collapse-btn');
+      colBtn.type = 'button';
+      colBtn.addEventListener('click', () => {
+        if (cotCollapsedIds.has(step.id)) cotCollapsedIds.delete(step.id);
+        else cotCollapsedIds.add(step.id);
+        renderTraceDrawer();
+      });
+      thHead.append(colBtn);
+      box.append(thHead);
+      if (!isCollapsed) {
+        const txt = step.cotText || '[Provider emitted encrypted reasoning tokens without plaintext summary]';
+        box.append(element('pre', txt, 'cot-thought-body'));
+      }
+      card.append(box);
+    }
+
+    if (tcCount > 0) {
+      for (const tc of step.toolCalls) {
+        const tBox = element('div', undefined, 'cot-tool-box');
+        const tHead = element('div', undefined, 'cot-tool-head');
+        tHead.append(element('span', tc.name || 'tool'));
+        if (tc.target) {
+          tHead.append(element('span', tc.target, 'cot-tool-target'));
+        }
+        tBox.append(tHead);
+        if (tc.argsPreview) {
+          const det = document.createElement('details');
+          det.className = 'cot-tool-details';
+          const sum = element('summary', 'ARGUMENTS');
+          det.append(sum, element('pre', tc.argsPreview, 'trace-pre'));
+          tBox.append(det);
+        }
+        card.append(tBox);
+      }
+    }
+
+    body.append(card);
+  }
+}
+
+function renderAgentsDrawer(ideAgents) {
+  if (!agentsToggle || !agentsDrawer) return;
+  const list = byId('agents-list');
+  const summary = byId('agents-summary');
+  if (!ideAgents || !Array.isArray(ideAgents.agents)) {
+    agentsToggle.textContent = 'In-IDE Agents';
+    return;
+  }
+  const agents = ideAgents.agents;
+  const unprot = Number(ideAgents.unprotectedCount || 0);
+  const extUnprot = Number(ideAgents.externalUnprotected || 0);
+  agentsToggle.textContent = unprot > 0 ? `In-IDE Agents (${unprot} setup)` : `In-IDE Agents (${agents.length} OK)`;
+  agentsToggle.className = unprot > 0 ? 'quiet es-pill warn' : 'quiet es-pill ok';
+  if (summary) summary.textContent = ideAgents.summary || '';
+  if (!agentsAutoOpened && extUnprot > 0) {
+    agentsAutoOpened = true;
+    agentsDrawer.hidden = false;
+    agentsToggle.setAttribute('aria-expanded', 'true');
+  }
+  if (!list) return;
+  list.replaceChildren();
+  for (const ag of agents) {
+    const card = element('section', undefined, 'agent-card');
+    const head = element('div', undefined, 'agent-card-head');
+    head.append(
+      element('strong', ag.displayName || ag.id),
+      element('span', ag.protected ? 'Protected' : 'Needs Setup', ag.protected ? 'agent-badge ok' : 'agent-badge warn')
     );
-    if (rehydrateEv.blocked_reason) {
-      s3.append(element('div', `Reason: ${rehydrateEv.blocked_reason}`, 'trace-flag'));
-    }
-  } else {
-    s3.append(element('div', 'Awaiting assistant turn completion.', 'trace-kv'));
+    card.append(
+      head,
+      element('div', `${ag.source} · ${ag.distributionClient}`, 'trace-kv'),
+      element('div', ag.mechanism, 'trace-kv'),
+      element('div', ag.detail, 'trace-kv')
+    );
+    list.append(card);
   }
-
-  body.append(s1, s2, s3);
 }
 
 function renderEigenScopeHeader(status) {
@@ -567,8 +712,20 @@ traceToggle?.addEventListener('click', () => {
   const nextOpen = traceDrawer.hidden;
   traceDrawer.hidden = !nextOpen;
   traceToggle.setAttribute('aria-expanded', String(nextOpen));
+  syncCotRefreshTimer();
+  if (nextOpen) host.postMessage({ type: 'refresh-cot-stream' });
   renderTraceDrawer();
 });
+agentsToggle?.addEventListener('click', () => {
+  const nextOpen = agentsDrawer.hidden;
+  agentsDrawer.hidden = !nextOpen;
+  agentsToggle.setAttribute('aria-expanded', String(nextOpen));
+  if (latestIdeAgents) renderAgentsDrawer(latestIdeAgents);
+});
+byId('configure-agents-btn')?.addEventListener('click', () => host.postMessage({ type: 'configure-ide-agents' }));
+byId('rescan-agents-btn')?.addEventListener('click', () => host.postMessage({ type: 'rescan-ide-agents' }));
+byId('copy-init-btn')?.addEventListener('click', () => host.postMessage({ type: 'copy-init-command' }));
+byId('open-agent-guide-btn')?.addEventListener('click', () => host.postMessage({ type: 'open-agent-guide' }));
 
 composer.addEventListener('submit', (event) => {
   event.preventDefault();
@@ -688,6 +845,8 @@ window.addEventListener('message', ({ data }) => {
     const nextOpen = traceDrawer.hidden;
     traceDrawer.hidden = !nextOpen;
     traceToggle.setAttribute('aria-expanded', String(nextOpen));
+    syncCotRefreshTimer();
+    if (nextOpen) host.postMessage({ type: 'refresh-cot-stream' });
     renderTraceDrawer();
     return;
   }
@@ -745,9 +904,18 @@ window.addEventListener('message', ({ data }) => {
     updateComposer();
   }
   if (data.eigenscopeStatus) renderEigenScopeHeader(data.eigenscopeStatus);
+  if (data.ideAgents) {
+    latestIdeAgents = data.ideAgents;
+    renderAgentsDrawer(data.ideAgents);
+  }
   if (Array.isArray(data.eigenscopeTraces)) {
     latestTraceEvents = data.eigenscopeTraces;
-    if (!traceDrawer.hidden) renderTraceDrawer();
+  }
+  if (Array.isArray(data.cotSteps)) {
+    latestCotSteps = data.cotSteps;
+  }
+  if ((Array.isArray(data.eigenscopeTraces) || Array.isArray(data.cotSteps)) && !traceDrawer.hidden) {
+    renderTraceDrawer();
   }
   byId('status').textContent = data.status;
   byId('chat-title').textContent = data.chatTitle || 'Pi';
@@ -836,5 +1004,6 @@ new ResizeObserver(() => setShare(preferredShare)).observe(splitLayout);
 
 host.postMessage({ type: 'ready' });
 document.addEventListener('visibilitychange', () => {
+  syncCotRefreshTimer();
   if (!document.hidden) host.postMessage({ type: 'ready' });
 });

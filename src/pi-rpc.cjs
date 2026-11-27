@@ -3,12 +3,13 @@
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const readline = require('node:readline');
+const { resolvePiCommand, buildPiSpawnEnv } = require('./setup.cjs');
 
 class PiRpcClient {
   constructor(options) {
     this.workspaceRoot = options.workspaceRoot;
     this.extensionDir = options.extensionDir;
-    this.piCommand = options.piCommand || 'pi';
+    this.piCommand = resolvePiCommand(options.piCommand || 'pi');
     this.envOverrides = options.envOverrides || {};
     this.onEvent = options.onEvent || (() => {});
     this.onExit = options.onExit || (() => {});
@@ -28,7 +29,7 @@ class PiRpcClient {
 
     this.child = spawn(this.piCommand, args, {
       cwd: this.workspaceRoot,
-      env: { ...process.env, ...this.envOverrides },
+      env: buildPiSpawnEnv(this.piCommand, { ...process.env, ...this.envOverrides }),
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
       windowsHide: true,

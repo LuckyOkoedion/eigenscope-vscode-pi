@@ -1,8 +1,8 @@
 {
   "name": "eigenscope-vscode-pi",
   "displayName": "EigenScope for VS Code & Pi",
-  "description": "Protected Pi coding agent inside VS Code with EigenScope zero-tag semantic separation, untrusted tool IPI sanitization, deterministic vault restoration, and a 3-stage protection and reasoning trace inspector.",
-  "version": "0.2.17",
+  "description": "Protect secrets, credentials, and client data across every AI coding agent in VS Code (Copilot, Pi, Claude Code, Cursor, Codex, Meta Muse Code, Cline, Continue, Gemini)—with 1-click zero-secret MCP/hook setup and a live RAM-only Chain-of-Thought Stream Explorer.",
+  "version": "0.2.19",
   "publisher": "guardian-ai",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -80,6 +80,11 @@
         "command": "eigenscopePi.openPricing",
         "category": "EigenScope",
         "title": "Upgrade / Add Prepaid Credit"
+      },
+      {
+        "command": "eigenscopePi.configureIdeAgents",
+        "category": "EigenScope",
+        "title": "Detect & Protect In-IDE AI Agents"
       }
     ],
     "configuration": {

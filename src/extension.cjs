@@ -16,6 +16,18 @@ const { buildEvidenceSummary } = require('./evidence.cjs');
 const { PiRpcClient } = require('./pi-rpc.cjs');
 const { createReviewManager } = require('./review.cjs');
 const {
+  CODING_GUIDE_URL,
+  configureIdeAgents,
+  detectIdeAgents,
+  discoverAndScanProviderCoT,
+  discoverProviderCoTSources,
+  ensureTraceExplorerInitialized,
+  extractProviderCoT,
+  extractProviderCoTSteps,
+  mergeTraceEvents,
+  readWorkspaceTraceReceipts,
+} = require('./agent-detect.cjs');
+const {
   DEFAULT_ENDPOINT,
   normalizeEndpointUrl,
   pollDeviceCode,
@@ -82,12 +94,29 @@ function renderWebviewHtml({ cspSource, styleUri, markdownItUri, markdownJsUri, 
         <span id="eigenscope-status" class="es-status">Initializing...</span>
       </div>
       <div class="es-group">
-        <button id="trace-toggle" type="button" class="quiet" aria-expanded="false">3-Stage Trace</button>
+        <button id="agents-toggle" type="button" class="quiet" aria-expanded="false">In-IDE Agents</button>
+        <button id="trace-toggle" type="button" class="quiet" aria-expanded="false">CoT Explorer</button>
         <button id="connect-eigenscope" type="button" class="quiet">Connect EigenScope</button>
         <button id="setup-pi" type="button" class="quiet">Set Up Pi</button>
         <button id="open-pricing" type="button" class="quiet">Upgrade / Credits</button>
       </div>
     </div>
+
+    <section id="agents-drawer" class="agents-drawer" hidden>
+      <div class="agents-drawer-header">
+        <div>
+          <strong>In-IDE &amp; Workspace AI Agent Detection</strong>
+          <span id="agents-summary" class="es-status">Scanning installed AI agents...</span>
+        </div>
+        <div class="es-group">
+          <button id="configure-agents-btn" type="button" class="dialog-primary">Configure Automated Protection (1-Click)</button>
+          <button id="rescan-agents-btn" type="button" class="quiet">Rescan</button>
+          <button id="copy-init-btn" type="button" class="quiet">Copy npx @eigenscope/init</button>
+          <button id="open-agent-guide-btn" type="button" class="quiet">Setup Guide</button>
+        </div>
+      </div>
+      <div id="agents-list" class="agents-list"></div>
+    </section>
 
     <header class="session-header">
       <div class="chat-heading">
@@ -105,8 +134,8 @@ function renderWebviewHtml({ cspSource, styleUri, markdownItUri, markdownJsUri, 
 
     <section id="trace-drawer" class="trace-drawer" hidden>
       <div class="trace-drawer-header">
-        <strong>3-Stage Protection &amp; Reasoning Trace (Live RAM)</strong>
-        <span id="trace-capability" class="es-status">No turns traced yet</span>
+        <strong>CoT Explorer (Live RAM Stream)</strong>
+        <span id="trace-capability" class="es-status">No reasoning captured yet</span>
       </div>
       <div id="trace-stages" class="trace-stages"></div>
     </section>
@@ -172,8 +201,10 @@ function renderWebviewHtml({ cspSource, styleUri, markdownItUri, markdownJsUri, 
 </html>`;
 }
 
-function createController(context) {
+function createController(context, deps = {}) {
   const beforeSnapshots = new Map();
+  const probePiCliFn = typeof deps.probePiCli === 'function' ? deps.probePiCli : probePiCli;
+  const createPiRpcFn = typeof deps.createPiRpc === 'function' ? deps.createPiRpc : (opts) => new PiRpcClient(opts);
   let viewRef = null;
   let rpc = null;
   let busy = false;
@@ -188,6 +219,11 @@ function createController(context) {
   let traceEvents = [];
   let dialogs = [];
   let cachedApiKey = '';
+  let piProbeCache = { checkedAt: 0, cmd: '', value: null };
+  let ideAgentsCache = { checkedAt: 0, key: '', value: null };
+  let lastReview = { active: false, rows: [], coverage: {}, omitted: 0, refreshFailed: false };
+  let lastMergedTraces = [];
+  let lastCotSteps = [];
 
   const beforeScheme = 'eigenscope-before';
   const beforeProvider = vscode.workspace.registerTextDocumentContentProvider(beforeScheme, {
@@ -252,13 +288,112 @@ function createController(context) {
     return '';
   }
 
-  function postState() {
+  function getCachedPiProbe(piCommand, force = false) {
+    const now = Date.now();
+    if (!force && piProbeCache.value && piProbeCache.cmd === piCommand && now - piProbeCache.checkedAt < 30000) {
+      return piProbeCache.value;
+    }
+    const probe = probePiCliFn(piCommand);
+    piProbeCache = { checkedAt: now, cmd: piCommand, value: probe };
+    return probe;
+  }
+
+  function getCachedIdeAgents({ root, installedExtensions, piReady, protectionMode, hasApiKey, force = false }) {
+    const now = Date.now();
+    const cacheKey = `${root}|${protectionMode}|${hasApiKey ? '1' : '0'}|${piReady ? '1' : '0'}|${installedExtensions.length}`;
+    if (!force && ideAgentsCache.value && ideAgentsCache.key === cacheKey && now - ideAgentsCache.checkedAt < 10000) {
+      return ideAgentsCache.value;
+    }
+    const detected = detectIdeAgents({
+      installedExtensions,
+      workspaceRoot: root,
+      piReady,
+      protectionMode,
+      hasApiKey,
+    });
+    ideAgentsCache = { checkedAt: now, key: cacheKey, value: detected };
+    return detected;
+  }
+
+  function postState(options = {}) {
     if (!viewRef) return;
+    const lightweight = Boolean(options && options.lightweight);
+    const force = Boolean(options && options.force);
     const root = workspaceRoot();
     const mgr = reviewManager.ensure(root);
-    const review = mgr ? mgr.refresh() : { active: false, rows: [], coverage: {}, omitted: 0, refreshFailed: false };
     const cfg = readConfig();
-    const piProbe = probePiCli(cfg.piCommand);
+    const piProbe =
+      lightweight && piProbeCache.value && piProbeCache.cmd === cfg.piCommand
+        ? piProbeCache.value
+        : getCachedPiProbe(cfg.piCommand, force);
+    const hasApiKey = Boolean(cachedApiKey || process.env.ORTHOCORE_API_KEY || process.env.EIGENSCOPE_API_KEY);
+    const installedExtensions = Array.isArray(vscode?.extensions?.all)
+      ? vscode.extensions.all.map((ext) => ext?.id).filter(Boolean)
+      : [];
+
+    let review = lastReview;
+    let ideAgents = ideAgentsCache.value;
+    let mergedTraces = lastMergedTraces;
+    let cotSteps = lastCotSteps;
+
+    if (!lightweight || !ideAgents) {
+      review = mgr ? mgr.refresh() : { active: false, rows: [], coverage: {}, omitted: 0, refreshFailed: false };
+      lastReview = review;
+      ideAgents = getCachedIdeAgents({
+        root,
+        installedExtensions,
+        piReady: piProbe.available,
+        protectionMode: cfg.protectionMode,
+        hasApiKey,
+        force,
+      });
+      if (root && ideAgents.agents.some((a) => a.id !== 'pi')) {
+        try {
+          ensureTraceExplorerInitialized(root);
+        } catch {
+          // Non-blocking auto-init
+        }
+      }
+      const wsTraces = root ? readWorkspaceTraceReceipts(root, { maxEntries: 60 }) : [];
+      let providerTraces = [];
+      let providerSteps = [];
+      try {
+        const scanned = discoverAndScanProviderCoT({
+          workspaceRoot: root,
+          force,
+        });
+        providerTraces = scanned.traces || [];
+        providerSteps = scanned.steps || [];
+      } catch {
+        // Non-blocking external CoT discovery
+      }
+      mergedTraces = mergeTraceEvents(traceEvents, [...wsTraces, ...providerTraces], 200);
+      lastMergedTraces = mergedTraces;
+
+      const piCotSteps = [];
+      for (let i = 0; i < traceEvents.length; i += 1) {
+        const ev = traceEvents[i];
+        if (ev && typeof ev.thinking_preview === 'string' && ev.thinking_preview.trim()) {
+          piCotSteps.push({
+            id: `pi:${i + 1}`,
+            stepNumber: 0,
+            timestamp: ev.timestamp_utc || '',
+            surface: ev.surface || 'pi_bridge',
+            provider: 'pi',
+            kind: 'CHAIN OF THOUGHT',
+            cotText: ev.thinking_preview.trim().slice(0, 2400),
+            encryptedOnly: false,
+            toolCalls: [],
+            flags: Array.isArray(ev.confusion_flags) ? ev.confusion_flags : [],
+            tokensIn: null,
+            tokensOut: null,
+          });
+        }
+      }
+      const combinedSteps = [...providerSteps, ...piCotSteps].slice(-40);
+      cotSteps = combinedSteps.map((s, idx) => ({ ...s, stepNumber: idx + 1 }));
+      lastCotSteps = cotSteps;
+    }
 
     viewRef.webview.postMessage({
       type: 'state',
@@ -286,11 +421,13 @@ function createController(context) {
       eigenscopeStatus: {
         mode: cfg.protectionMode,
         endpointUrl: cfg.endpointUrl,
-        hasApiKey: Boolean(cachedApiKey || process.env.ORTHOCORE_API_KEY || process.env.EIGENSCOPE_API_KEY),
+        hasApiKey,
         piReady: piProbe.available,
-        evidence: buildEvidenceSummary(traceEvents),
+        evidence: buildEvidenceSummary(mergedTraces),
       },
-      eigenscopeTraces: traceEvents,
+      ideAgents,
+      eigenscopeTraces: mergedTraces,
+      cotSteps,
     });
   }
 
@@ -302,7 +439,7 @@ function createController(context) {
     const mgr = reviewManager.ensure(root);
     if (mgr && !mgr.hasBaseline()) mgr.beginBaseline();
 
-    rpc = new PiRpcClient({
+    rpc = createPiRpcFn({
       workspaceRoot: root,
       extensionDir: context.extensionPath,
       piCommand: cfg.piCommand,
@@ -346,12 +483,12 @@ function createController(context) {
           } else {
             messages.push({ role: 'Pi', text: delta });
           }
-          postState();
+          postState({ lightweight: true });
           return;
         }
         if (ev.type === 'turn_end' || ev.type === 'agent_end') {
           busy = false;
-          postState();
+          postState({ force: true });
         }
       },
       onExit: (code) => {
@@ -452,7 +589,7 @@ function createController(context) {
     if (!data || typeof data !== 'object') return;
     if (data.type === 'ready') {
       await refreshApiKey();
-      postState();
+      postState({ force: true });
       return;
     }
     if (data.type === 'toggle-protection') {
@@ -470,6 +607,25 @@ function createController(context) {
     if (data.type === 'open-pricing') {
       const cfg = readConfig();
       await vscode.env.openExternal(vscode.Uri.parse(`${cfg.endpointUrl}/pricing`));
+      return;
+    }
+    if (data.type === 'rescan-ide-agents' || data.type === 'refresh-cot-stream') {
+      postState({ force: true });
+      return;
+    }
+    if (data.type === 'configure-ide-agents') {
+      await configureDetectedIdeAgents().catch((err) => vscode.window.showErrorMessage(err.message));
+      return;
+    }
+    if (data.type === 'copy-init-command') {
+      const cfg = readConfig();
+      const cmd = `npx --yes --package @eigenscope/init eigenscope init --ide auto --endpoint ${cfg.endpointUrl} --usecase coding`;
+      await vscode.env.clipboard.writeText(cmd);
+      vscode.window.showInformationMessage(`Copied automated setup command: ${cmd}`);
+      return;
+    }
+    if (data.type === 'open-agent-guide') {
+      await vscode.env.openExternal(vscode.Uri.parse(CODING_GUIDE_URL));
       return;
     }
     if (data.type === 'open-link') {
@@ -688,11 +844,43 @@ function createController(context) {
     },
   };
 
+  async function configureDetectedIdeAgents() {
+    const root = workspaceRoot();
+    if (!root) {
+      throw new Error('Open a workspace folder before configuring automated MCP/hook protection.');
+    }
+    const cfg = readConfig();
+    const installedExtensions = Array.isArray(vscode?.extensions?.all)
+      ? vscode.extensions.all.map((ext) => ext?.id).filter(Boolean)
+      : [];
+    const piProbe = probePiCli(cfg.piCommand);
+    const hasApiKey = Boolean(cachedApiKey || process.env.ORTHOCORE_API_KEY || process.env.EIGENSCOPE_API_KEY);
+    const detection = detectIdeAgents({
+      installedExtensions,
+      workspaceRoot: root,
+      piReady: piProbe.available,
+      protectionMode: cfg.protectionMode,
+      hasApiKey,
+    });
+    const result = configureIdeAgents({
+      workspaceRoot: root,
+      endpointUrl: cfg.endpointUrl,
+      policyPreset: 'CODING_AGENT_FIREWALL',
+      agents: detection.agents,
+    });
+    postState({ force: true });
+    vscode.window.showInformationMessage(
+      `Configured zero-secret EigenScope automation (${result.writtenFiles.join(', ')}).`
+    );
+    return result;
+  }
+
   return {
     provider,
     connectAccount,
     setupPi,
     toggleProtection,
+    configureDetectedIdeAgents,
     handleWebviewMessage,
     getStateSnapshot: () => ({
       activeModel,
@@ -727,6 +915,7 @@ function activate(context) {
     vscode.commands.registerCommand('eigenscopePi.toggleProtection', ctrl.toggleProtection),
     vscode.commands.registerCommand('eigenscopePi.toggleTraceDrawer', ctrl.toggleTraceDrawer),
     vscode.commands.registerCommand('eigenscopePi.openPricing', ctrl.openPricing),
+    vscode.commands.registerCommand('eigenscopePi.configureIdeAgents', ctrl.configureDetectedIdeAgents),
     { dispose: ctrl.dispose }
   );
 }
@@ -743,7 +932,17 @@ module.exports = {
   createController,
   renderWebviewHtml,
   nextProtectionMode,
+  normalizeEndpointUrl,
   sanitizeExternalUrl,
   classifyToolApproval,
+  detectIdeAgents,
+  configureIdeAgents,
+  ensureTraceExplorerInitialized,
+  readWorkspaceTraceReceipts,
+  mergeTraceEvents,
+  extractProviderCoT,
+  extractProviderCoTSteps,
+  discoverProviderCoTSources,
+  discoverAndScanProviderCoT,
   _setVscodeForTest,
 };

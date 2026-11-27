@@ -110,11 +110,94 @@ function writeCredentialsFile(payload, credentialsPath = defaultCredentialsPath(
   return safePath;
 }
 
-function probePiCli(piCommand = 'pi') {
-  const cmd = String(piCommand || 'pi').trim() || 'pi';
+function isExecutableCandidate(filePath) {
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile()) return false;
+    if (process.platform !== 'win32') {
+      fs.accessSync(filePath, constants.X_OK);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function collectNodeManagerBins(homeDir, env, platform) {
+  const dirs = [];
+  const push = (d) => {
+    if (d && !dirs.includes(d)) dirs.push(d);
+  };
+  if (platform === 'win32') {
+    const appData = (env && env.APPDATA) || path.join(homeDir, 'AppData', 'Roaming');
+    const localApp = (env && env.LOCALAPPDATA) || path.join(homeDir, 'AppData', 'Local');
+    push(path.join(appData, 'npm'));
+    push(path.join(homeDir, '.volta', 'bin'));
+    push(path.join(localApp, 'Volta', 'bin'));
+    push(path.join(homeDir, '.bun', 'bin'));
+    return dirs;
+  }
+  const nvmDir = (env && env.NVM_DIR) || path.join(homeDir, '.nvm');
+  const nvmNodes = path.join(nvmDir, 'versions', 'node');
+  try {
+    const versions = fs.readdirSync(nvmNodes).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of versions.slice(0, 12)) {
+      push(path.join(nvmNodes, v, 'bin'));
+    }
+  } catch {}
+  const fnmDir = path.join(homeDir, '.local', 'share', 'fnm', 'node-versions');
+  try {
+    const versions = fs.readdirSync(fnmDir).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of versions.slice(0, 12)) {
+      push(path.join(fnmDir, v, 'installation', 'bin'));
+    }
+  } catch {}
+  push(path.join(homeDir, '.volta', 'bin'));
+  push(path.join(homeDir, '.npm-global', 'bin'));
+  push(path.join(homeDir, '.bun', 'bin'));
+  push(path.join(homeDir, '.local', 'bin'));
+  push('/opt/homebrew/bin');
+  push('/usr/local/bin');
+  return dirs;
+}
+
+function resolvePiCommand(
+  piCommand = 'pi',
+  { homeDir = os.homedir(), env = process.env, platform = process.platform } = {}
+) {
+  const raw = String(piCommand || 'pi').trim() || 'pi';
+  if (raw.includes('/') || raw.includes('\\')) {
+    return path.resolve(raw);
+  }
+  const binNames = platform === 'win32' ? [`${raw}.cmd`, `${raw}.exe`, raw] : [raw];
+  const envPath = String((env && env.PATH) || '');
+  const searchDirs = [...envPath.split(path.delimiter).filter(Boolean), ...collectNodeManagerBins(homeDir, env, platform)];
+  for (const dir of searchDirs) {
+    for (const name of binNames) {
+      const candidate = path.join(dir, name);
+      if (isExecutableCandidate(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return raw;
+}
+
+function buildPiSpawnEnv(resolvedCmd, baseEnv = process.env) {
+  if (!path.isAbsolute(resolvedCmd)) return { ...baseEnv };
+  const binDir = path.dirname(resolvedCmd);
+  const currentPath = String(baseEnv.PATH || '');
+  const parts = currentPath.split(path.delimiter).filter(Boolean);
+  if (parts.includes(binDir)) return { ...baseEnv };
+  return { ...baseEnv, PATH: [binDir, ...parts].join(path.delimiter) };
+}
+
+function probePiCli(piCommand = 'pi', options = {}) {
+  const cmd = resolvePiCommand(piCommand, options);
   const res = spawnSync(cmd, ['--version'], {
     encoding: 'utf8',
     timeout: 5000,
+    env: buildPiSpawnEnv(cmd, (options && options.env) || process.env),
     shell: process.platform === 'win32',
     windowsHide: true,
   });
@@ -203,7 +286,7 @@ async function requestDeviceCode(baseUrl, fetchImpl = fetch) {
   const res = await fetchImpl(`${endpoint}/api/onboarding/device-code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=utf-8', Accept: 'application/json' },
-    body: JSON.stringify({ surface: 'vscode_pi', client_version: '0.2.17' }),
+    body: JSON.stringify({ surface: 'vscode_pi', client_version: '0.2.19' }),
     redirect: 'error',
     signal: AbortSignal.timeout(10000),
   });
@@ -255,6 +338,8 @@ module.exports = {
   defaultCredentialsPath,
   readCredentialsFile,
   writeCredentialsFile,
+  resolvePiCommand,
+  buildPiSpawnEnv,
   probePiCli,
   validateVerificationUri,
   requestDeviceCode,
